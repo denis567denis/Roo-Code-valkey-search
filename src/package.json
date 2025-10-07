@@ -483,6 +483,7 @@
 		"i18next": "^25.0.0",
 		"ignore": "^7.0.3",
 		"iovalkey": "^0.3.3",
+		"redis": "^5.8.3",
 		"isbinaryfile": "^5.0.2",
 		"jwt-decode": "^4.0.0",
 		"lodash.debounce": "^4.0.8",

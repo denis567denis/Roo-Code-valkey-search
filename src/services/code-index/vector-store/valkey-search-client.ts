@@ -1,14 +1,15 @@
-import Valkey, { Command, Redis } from "iovalkey"
+import { createClient, RedisClientType } from "redis"
 import { createHash } from "crypto"
 import * as path from "path"
+import * as vscode from "vscode"
 import { IVectorStore, VectorStoreSearchResult, Payload } from "../interfaces"
 import { DEFAULT_MAX_SEARCH_RESULTS, DEFAULT_SEARCH_MIN_SCORE } from "../constants"
 import { t } from "../../../i18n"
 
 export class ValkeySearchVectorStore implements IVectorStore {
 	private readonly vectorSize: number
-	private readonly DISTANCE_METRIC = "L2"
-	private client: Redis | null = null
+	private readonly DISTANCE_METRIC = "COSINE"
+	private client: RedisClientType | null = null
 	private isInitializing = false
 	private readonly indexName: string
 	private readonly valkeyHostname: string
@@ -17,6 +18,27 @@ export class ValkeySearchVectorStore implements IVectorStore {
 	private readonly valkeyPassword?: string
 	private readonly useSsl: boolean
 	private readonly workspacePath: string
+	private static outputChannel: vscode.OutputChannel | null = null
+
+	static getOutputChannel(): vscode.OutputChannel {
+		if (!ValkeySearchVectorStore.outputChannel) {
+			ValkeySearchVectorStore.outputChannel = vscode.window.createOutputChannel("ValkeySearch")
+		}
+
+		return ValkeySearchVectorStore.outputChannel
+	}
+
+	// Метод для логирования в Output Channel
+	static log(message: string, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO'): void {
+		const timestamp = new Date().toISOString()
+		const logMessage = `[${timestamp}] [${level}] ${message}`
+
+		// Выводим в наш специальный Output Channel
+		ValkeySearchVectorStore.getOutputChannel().appendLine(logMessage)
+
+		// Также выводим в консоль для совместимости
+		console.log(`[ValkeySearch] ${message}`)
+	}
 
 	constructor(
 		workspacePath: string,
@@ -40,6 +62,16 @@ export class ValkeySearchVectorStore implements IVectorStore {
 		this.initializeClient()
 	}
 
+	private normalizeVector(vector: number[]): number[] {
+		const norm = Math.sqrt(vector.reduce((sum, val) => sum + val * val, 0));
+
+		if (norm === 0) {
+			return vector;
+		}
+
+		return vector.map(val => val / norm);
+	}
+
 	private async initializeClient(): Promise<void> {
 		if (this.isInitializing) {
 			console.log("[ValkeySearch] Connection already initializing")
@@ -49,41 +81,38 @@ export class ValkeySearchVectorStore implements IVectorStore {
 		this.isInitializing = true
 
 		try {
-			this.client = new Valkey({
-				password: this.valkeyPassword,
-				username: this.valkeyUsername,
-				host: this.valkeyHostname,
-				port: this.valkeyPort,
-				tls: this.useSsl ? {} : undefined,
+			const url = this.useSsl
+				? `rediss://${this.valkeyUsername}:${this.valkeyPassword}@${this.valkeyHostname}:${this.valkeyPort}`
+				: `redis://${this.valkeyUsername}:${this.valkeyPassword}@${this.valkeyHostname}:${this.valkeyPort}`
+
+			this.client = createClient({
+				url
 			})
+
 			this.client.on("error", (error: Error) => {
-				console.error("[ValkeySearch] Connection error:", error.message)
+				ValkeySearchVectorStore.log("[ValkeySearch] Connection error: " + error.message)
 				this.isInitializing = false
-				throw new Error(
-					t("embeddings:vectorStore.vectorError", {
-						errorMessage: error.message,
-					}),
-				)
 			})
 
 			this.client.on("ready", () => {
 				this.isInitializing = false
-				console.log("[ValkeySearch] Connection established")
+				ValkeySearchVectorStore.log("[ValkeySearch] Connection established")
 			})
 
 			this.client.on("end", () => {
-				console.log("[ValkeySearch] Connection closed")
+				ValkeySearchVectorStore.log("[ValkeySearch] Connection closed")
 				this.destroy()
 			})
 
 			await this.client.connect()
 		} catch (error) {
 			this.isInitializing = false
+			ValkeySearchVectorStore.log("[ValkeySearch] Connection failed:", error.message)
 			if (error instanceof Error) {
 				throw new Error(
 					t("embeddings:vectorStore.valkeyConnectionFailed", {
 						valkeyUrl: `${this.valkeyHostname}:${this.valkeyPort}`,
-						errorMessage: error,
+						errorMessage: error.message,
 					}),
 				)
 			}
@@ -92,7 +121,7 @@ export class ValkeySearchVectorStore implements IVectorStore {
 	}
 
 	private async ensureConnected() {
-		if (!this.client || this.client.status !== "ready") {
+		if (!this.client || !this.client.isReady) {
 			await this.initializeClient()
 		}
 	}
@@ -101,11 +130,8 @@ export class ValkeySearchVectorStore implements IVectorStore {
 		await this.ensureConnected()
 
 		try {
-			const infoArray = await this.client?.sendCommand(
-				new Command("FT.INFO", [this.indexName], {
-					replyEncoding: "utf-8",
-				}),
-			)
+			const infoArray = await this.client?.ft.info(this.indexName)
+			ValkeySearchVectorStore.log("FT INFO result: " + JSON.stringify(infoArray))
 			const dimension = await this.getIndexDimension(this.indexName)
 
 			if (Array.isArray(infoArray) && dimension === this.vectorSize) {
@@ -121,42 +147,40 @@ export class ValkeySearchVectorStore implements IVectorStore {
 			await this._createIndex()
 			await this.saveIndexDimension(this.indexName, this.vectorSize)
 			return true
-		} catch (error) {
+		} catch (error: any) {
 			throw new Error(error.message)
 		}
 	}
 
 	private async _createIndex(): Promise<void> {
-		await this.client?.sendCommand(
-			new Command("FT.CREATE", [
-				this.indexName,
-				"ON",
-				"HASH",
-				"SCHEMA",
-				"vector",
-				"VECTOR",
-				"HNSW",
-				"10",
-				"TYPE",
-				"FLOAT32",
-				"DIM",
-				String(this.vectorSize),
-				"DISTANCE_METRIC",
-				this.DISTANCE_METRIC,
-				"M",
-				"64",
-				"EF_CONSTRUCTION",
-				"512",
-				"pathSegments",
-				"TAG",
-				"SEPARATOR",
-				"|",
-				"CASESENSITIVE",
-				"filePath",
-				"TAG",
-				"CASESENSITIVE",
-			]),
-		)
+		await this.client?.ft.create(this.indexName,
+			{
+				'$.embedding': {
+					type: 'VECTOR',
+					ALGORITHM: 'HNSW',
+					TYPE: 'FLOAT32',
+					DISTANCE_METRIC: 'COSINE',
+					DIM: this.vectorSize,
+					M: 64,
+					EF_CONSTRUCTION: 512,
+					AS: 'embedding'
+				},
+				'$.pathSegments': {
+					type: 'TAG',
+					SEPARATOR: '|',
+					CASESENSITIVE: true,
+					AS: 'pathSegments'
+				},
+				'$.filePath': {
+					type: 'TAG',
+					CASESENSITIVE: true,
+					AS: 'filePath'
+				}
+			},
+			{
+				ON: 'JSON',
+
+			})
 		await this.saveIndexDimension(this.indexName, this.vectorSize)
 	}
 
@@ -187,37 +211,29 @@ export class ValkeySearchVectorStore implements IVectorStore {
 
 		if (points.length === 0) return
 
-		const pipeline = this.client?.pipeline()
+		const multi = this.client?.multi()
 		for (const point of points) {
 			const docId = `${this.indexName}:${point.id}`
 
 			const pathSegments = this.buildPathSegments(point.payload?.filePath)
 
-			const args = [
-				docId,
-				"filePath",
-				point.payload.filePath,
-				"pathSegments",
-				pathSegments.join("|"),
-				"codeChunk",
-				point.payload.codeChunk,
-				"startLine",
-				String(point.payload.startLine),
-				"endLine",
-				String(point.payload.endLine),
-				"vector",
-				this.float32Buffer(point.vector),
-			]
+			const args: Record<string, string | number[]> = {
+				filePath: point.payload.filePath,
+				pathSegments: pathSegments.join("|"),
+				codeChunk: point.payload.codeChunk,
+				startLine: String(point.payload.startLine),
+				endLine: String(point.payload.endLine),
+				embedding: point.vector,
+			}
 
-			pipeline?.call("HSET", args)
+			multi?.json.set(docId, '$', args)
 		}
-		await pipeline?.exec()
+		await multi?.exec()
 	}
 
 	float32Buffer(arr: number[]) {
 		const floatArray = new Float32Array(arr)
-		const float32Buffer = Buffer.from(floatArray.buffer)
-		return float32Buffer
+		return Buffer.from(floatArray.buffer)
 	}
 
 	async search(
@@ -232,7 +248,7 @@ export class ValkeySearchVectorStore implements IVectorStore {
 		if (directoryPrefix) {
 			const normalizedPrefix = path.posix.normalize(directoryPrefix.replace(/\\/g, "/"))
 			if (normalizedPrefix !== "." && normalizedPrefix !== "./") {
-				directoryFilter = normalizedPrefix
+				directoryFilter = normalizedPrefix.replace(/\./g, "\\.").replace(/\//g, "\\/").replace(/-/g, "\\-")
 			}
 		}
 
@@ -240,58 +256,47 @@ export class ValkeySearchVectorStore implements IVectorStore {
 		const searchLimit = maxResults ?? DEFAULT_MAX_SEARCH_RESULTS
 
 		const q = directoryFilter
-			? `@pathSegments:{${directoryFilter}*} => [KNN ${searchLimit} @vector $qvec AS score]`
-			: `*=>[KNN ${searchLimit} @vector $qvec AS score]`
+			? `@pathSegments:{${directoryFilter}*} => [KNN ${searchLimit} @embedding $B EF_RUNTIME 200 AS score]`
+			: `*=>[KNN ${searchLimit} @embedding $B EF_RUNTIME 200 AS score]`
 
-		const searchParams = [
-			this.indexName,
-			q,
-			"PARAMS",
-			"2",
-			"qvec",
-			vectorBuffer,
-			"RETURN",
-			"5",
-			"score",
-			"filePath",
-			"codeChunk",
-			"startLine",
-			"endLine",
-			"DIALECT",
-			"2",
-			"LIMIT",
-			"0",
-			String(searchLimit),
-		]
+		ValkeySearchVectorStore.log('> Search query: ' + queryVector.length)
 
-		const results = await this.client?.sendCommand(
-			new Command("FT.SEARCH", searchParams, { replyEncoding: "utf8" }),
+		const results = await this.client?.ft.search(this.indexName, q,
+			{
+				PARAMS: {
+					B: vectorBuffer,
+				},
+				RETURN: ["score", "$.filePath", "$.codeChunk", "$.startLine", "$.endLine"],
+				DIALECT: 2,
+				LIMIT: {
+					from: 0,
+					size: searchLimit,
+				}
+			}
 		)
 
-		if (!Array.isArray(results) || results.length < 2) {
+
+		if (!results?.documents) {
 			return []
 		}
 
+		ValkeySearchVectorStore.log('> Search results: ' + results.documents.length)
+
 		const parsedResults: VectorStoreSearchResult[] = []
 
-		for (let i = 1; i < results.length; i += 2) {
-			const docId = results[i] as string
-			const fields = results[i + 1] as string[]
-
-			const score = parseFloat(fields[1])
-			const payload: Payload = {
-				filePath: fields[3],
-				codeChunk: fields[5],
-				startLine: parseInt(fields[7]),
-				endLine: parseInt(fields[9]),
-			}
-
+		results?.documents.forEach((doc) => {
+			ValkeySearchVectorStore.log('doc ' + JSON.stringify(doc))
 			parsedResults.push({
-				id: docId.replace(`${this.indexName}:`, ""),
-				payload: payload,
-				score: 1 - score,
+				id: doc.id.replace(`${this.indexName}:`, ""),
+				payload: {
+					filePath: doc.value['$.filePath'] as string,
+					codeChunk: doc.value['$.codeChunk'] as string,
+					startLine: parseInt(doc.value['$.startLine'] as string),
+					endLine: parseInt(doc.value['$.endLine'] as string),
+				},
+				score: 1 - parseFloat(String(doc.value.score))
 			})
-		}
+		})
 
 		return parsedResults
 			.filter((r) => r.score >= (minScore || DEFAULT_SEARCH_MIN_SCORE))
@@ -316,23 +321,23 @@ export class ValkeySearchVectorStore implements IVectorStore {
 			const normalizedFilePaths = filePaths.map((filePath) => {
 				const relativePath = path.isAbsolute(filePath) ? path.relative(workspaceRoot, filePath) : filePath
 				const normalizedRelativePath = relativePath.startsWith("/") ? relativePath.slice(1) : relativePath
-				return `${path.posix.normalize(normalizedRelativePath.replace(/\\/g, "/")).replaceAll(".", "\\.").replaceAll("/", "\\/").replaceAll("-", "\\-")}`
+				return `${path.posix.normalize(normalizedRelativePath.replace(/\\/g, "/")).replace(/\./g, "\\.").replace(/\//g, "\\/").replace(/-/g, "\\-")}`
 			})
 			const query = `@filePath:{${normalizedFilePaths.join("|")}}`
 
-			const result = await this.client?.sendCommand(
-				new Command("FT.SEARCH", [this.indexName, query, "NOCONTENT", "LIMIT", "0", "10000"], {
-					replyEncoding: "utf8",
-				}),
-			)
-
-			const pipeline = this.client?.pipeline()
-			if (Array.isArray(result) && result.length > 1) {
-				for (let i = 1; i < result.length; i++) {
-					const docId = result[i] as string
-					pipeline?.call("DEL", [docId])
+			const result = await this.client?.ft.search(this.indexName, query, {
+				LIMIT: {
+					from: 0,
+					size: 10000,
 				}
-				await pipeline?.exec()
+			})
+
+			const multi = this.client?.multi()
+			if (result?.documents) {
+				result?.documents.forEach((doc) => {
+					multi?.del(doc.id)
+				})
+				await multi?.exec()
 			}
 		} catch (error) {
 			console.error("Failed to delete points by file paths:", error)
@@ -343,36 +348,45 @@ export class ValkeySearchVectorStore implements IVectorStore {
 	async deleteCollection(): Promise<void> {
 		await this.ensureConnected()
 		await this.clearCollection()
-		await this.client?.sendCommand(new Command("FT.DROPINDEX", [this.indexName]))
+		await this.client?.sendCommand(["FT.DROPINDEX", this.indexName])
 		await this.removeIndexDimension(this.indexName)
 	}
 
 	async clearCollection(): Promise<void> {
-		await this.ensureConnected()
-		const result = await this.client?.sendCommand(
-			new Command("FT.SEARCH", [this.indexName, "*", "NOCONTENT", "LIMIT", "0", "1000000"], {
-				replyEncoding: "utf8",
-			}),
-		)
+		try {
+			await this.ensureConnected()
+			const result = await this.client?.sendCommand([
+				"FT.SEARCH",
+				this.indexName,
+				"*",
+				"NOCONTENT",
+				"LIMIT",
+				"0",
+				"1000000",
+			])
 
-		if (Array.isArray(result) && result.length > 1) {
-			const pipeline = this.client?.pipeline()
-			for (let i = 1; i < result.length; i++) {
-				const docId = result[i] as string
-				pipeline?.call("DEL", [docId])
+			if (Array.isArray(result)) {
+				ValkeySearchVectorStore.log('> Clear collection: ' + result.length)
+				if (result.length > 1) {
+					const multi = this.client?.multi()
+					for (let i = 1; i < result.length; i++) {
+						const docId = result[i] as string
+						multi?.json.del(docId)
+					}
+					await multi?.exec()
+					ValkeySearchVectorStore.log('> Clear collection: done ')
+				}
 			}
-			await pipeline?.exec()
+		} catch (error: any) {
+			ValkeySearchVectorStore.log("Failed to clear collection: " + error.message, "ERROR")
 		}
 	}
 
 	async collectionExists(): Promise<boolean> {
 		await this.ensureConnected()
 		try {
-			await this.client?.sendCommand(
-				new Command("FT.INFO", [this.indexName], {
-					replyEncoding: "utf-8",
-				}),
-			)
+			const result = await this.client?.ft.info(this.indexName)
+			ValkeySearchVectorStore.log("FT INFO result: " + JSON.stringify(result))
 			return true
 		} catch (error) {
 			return false
@@ -392,8 +406,7 @@ export class ValkeySearchVectorStore implements IVectorStore {
 			createdAt: new Date().toISOString(),
 			distanceMetric: this.DISTANCE_METRIC,
 		}
-
-		await this.client?.sendCommand(new Command("JSON.SET", [key, "$", JSON.stringify(metadata)]))
+		await this.client?.json.set(key, "$", metadata)
 	}
 
 	/**
@@ -406,17 +419,18 @@ export class ValkeySearchVectorStore implements IVectorStore {
 		try {
 			const key = `index:meta:${indexName}`
 
-			const result = await this.client?.sendCommand(
-				new Command("JSON.GET", [key, "$.dimension"], {
-					replyEncoding: "utf8",
-				}),
-			)
+			const result = await this.client?.json.get(key, {
+				path: "$.dimension",
+			})
 
 			if (result && typeof result === "string") {
-				const parsed = JSON.parse(result)
-				if (Array.isArray(parsed) && parsed.length > 0) {
-					return parsed[0]
-				}
+
+				return Number(result)
+			}
+
+			if (result && typeof result === "number") {
+
+				return result
 			}
 
 			return null
@@ -428,12 +442,20 @@ export class ValkeySearchVectorStore implements IVectorStore {
 	async removeIndexDimension(indexName: string): Promise<void> {
 		await this.ensureConnected()
 		const key = `index:meta:${indexName}`
-		await this.client?.sendCommand(new Command("JSON.DEL", [key]))
+		await this.client?.json.del(key)
 	}
 
 	async destroy() {
 		if (this.client && this.client.disconnect) {
 			this.client.disconnect()
+		}
+	}
+
+	// Статический метод для очистки Output Channel
+	static disposeOutputChannel(): void {
+		if (ValkeySearchVectorStore.outputChannel) {
+			ValkeySearchVectorStore.outputChannel.dispose()
+			ValkeySearchVectorStore.outputChannel = null
 		}
 	}
 }
