@@ -7,6 +7,7 @@ import { t } from "../../../i18n"
 
 export class ValkeySearchVectorStore implements IVectorStore {
 	private readonly vectorSize: number
+	private readonly vectorByteSize: number
 	private readonly DISTANCE_METRIC = "COSINE"
 	private client: Redis | null = null
 	private isInitializing = false
@@ -33,6 +34,7 @@ export class ValkeySearchVectorStore implements IVectorStore {
 		this.valkeyUsername = username
 		this.valkeyPassword = password
 		this.vectorSize = vectorSize
+		this.vectorByteSize = vectorSize * Float32Array.BYTES_PER_ELEMENT
 		this.useSsl = useSsl || false
 
 		const hash = createHash("sha256").update(workspacePath).digest("hex")
@@ -187,37 +189,50 @@ export class ValkeySearchVectorStore implements IVectorStore {
 
 		if (points.length === 0) return
 
-		const pipeline = this.client?.pipeline()
-		for (const point of points) {
-			const docId = `${this.indexName}:${point.id}`
+		const client = this.client
+		if (!client) return
 
-			const pathSegments = this.buildPathSegments(point.payload?.filePath)
+		const batchSize = 512
+		for (let i = 0; i < points.length; i += batchSize) {
+			const batch = points.slice(i, i + batchSize)
+			const pipeline = client.pipeline()
 
-			const args = [
-				docId,
-				"filePath",
-				point.payload.filePath,
-				"pathSegments",
-				pathSegments.join("|"),
-				"codeChunk",
-				point.payload.codeChunk,
-				"startLine",
-				String(point.payload.startLine),
-				"endLine",
-				String(point.payload.endLine),
-				"vector",
-				this.float32Buffer(point.vector),
-			]
+			for (const point of batch) {
+				const docId = `${this.indexName}:${point.id}`
+				const pathSegments = this.buildPathSegments(point.payload?.filePath)
+				const args = [
+					docId,
+					"filePath",
+					point.payload.filePath,
+					"pathSegments",
+					pathSegments.join("|"),
+					"codeChunk",
+					point.payload.codeChunk,
+					"startLine",
+					String(point.payload.startLine),
+					"endLine",
+					String(point.payload.endLine),
+					"vector",
+					this.float32Buffer(point.vector),
+				]
 
-			pipeline?.call("HSET", args)
+				pipeline.call("HSET", args)
+			}
+
+			await pipeline.exec()
 		}
-		await pipeline?.exec()
 	}
 
 	float32Buffer(arr: number[]) {
-		const floatArray = new Float32Array(arr)
-		const float32Buffer = Buffer.from(floatArray.buffer)
-		return float32Buffer
+		if (arr.length !== this.vectorSize) {
+			throw new Error(`Vector length ${arr.length} does not match configured size ${this.vectorSize}`)
+		}
+
+		const buffer = Buffer.allocUnsafe(this.vectorByteSize)
+		for (let i = 0; i < arr.length; i++) {
+			buffer.writeFloatLE(arr[i], i * Float32Array.BYTES_PER_ELEMENT)
+		}
+		return buffer
 	}
 
 	async search(
@@ -342,8 +357,27 @@ export class ValkeySearchVectorStore implements IVectorStore {
 
 	async deleteCollection(): Promise<void> {
 		await this.ensureConnected()
-		await this.clearCollection()
-		await this.client?.sendCommand(new Command("FT.DROPINDEX", [this.indexName]))
+		const client = this.client
+		if (!client) {
+			return
+		}
+
+		let dropSucceeded = false
+		try {
+			await client.sendCommand(new Command("FT.DROPINDEX", [this.indexName, "DD"]))
+			dropSucceeded = true
+		} catch (error) {
+			const message = error instanceof Error ? error.message : ""
+			const unknownIndex = message.includes("Unknown Index name") || message.includes("no such index")
+
+			if (!unknownIndex) {
+				console.warn("[ValkeySearch] FT.DROPINDEX DD failed, falling back to manual cleanup:", message)
+				await this.clearCollection()
+				await client.sendCommand(new Command("FT.DROPINDEX", [this.indexName]))
+				dropSucceeded = true
+			}
+		}
+
 		await this.removeIndexDimension(this.indexName)
 	}
 
